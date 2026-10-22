@@ -6,7 +6,7 @@
 #include <array>
 #include <atomic>
 #include <mutex>
-#include <unordered_set>
+#include <unordered_map>
 
 // PSN is not emulated: the user is reported as signed out and online queries fail.
 static constexpr int SCE_NP_ERROR_INVALID_ARGUMENT = static_cast<int>(0x80550003);
@@ -14,7 +14,9 @@ static constexpr int SCE_NP_ERROR_SIGNED_OUT = static_cast<int>(0x80550006);
 static constexpr int SCE_NP_ERROR_USER_NOT_FOUND = static_cast<int>(0x80550007);
 static constexpr int SCE_NP_ERROR_CALLBACK_ALREADY_REGISTERED = static_cast<int>(0x80550008);
 static constexpr int SCE_NP_ERROR_CALLBACK_NOT_REGISTERED = static_cast<int>(0x80550009);
+static constexpr int SCE_NP_ERROR_ABORTED = static_cast<int>(0x80550012);
 static constexpr int SCE_NP_ERROR_REQUEST_NOT_FOUND = static_cast<int>(0x80550014);
+static constexpr int SCE_NP_ERROR_INVALID_ID = static_cast<int>(0x80550015);
 static constexpr int SCE_NP_ERROR_CALLBACK_MAX = static_cast<int>(0x8055001D);
 static constexpr uint32_t NP_STATE_SIGNED_OUT = 1;
 static constexpr int NP_POLL_ASYNC_FINISHED = 0;
@@ -26,14 +28,36 @@ namespace {
 std::mutex reachabilityMutex;
 void* reachabilityCallback = nullptr;
 void* reachabilityUserdata = nullptr;
-std::mutex requestMutex;
-std::unordered_set<int> liveRequests;
 
-int AddRequest() {
+struct NpRequest {
+    bool async = false;
+    bool aborted = false;
+};
+
+std::mutex requestMutex;
+std::unordered_map<int, NpRequest> requests;
+
+int AddRequest(bool async) {
     const int reqId = g_nextRequest.fetch_add(1, std::memory_order_relaxed);
     std::lock_guard lock(requestMutex);
-    liveRequests.insert(reqId);
+    requests.insert({reqId, NpRequest{async, false}});
     return reqId;
+}
+
+bool RequestLive(int reqId) {
+    std::lock_guard lock(requestMutex);
+    return requests.count(reqId) != 0;
+}
+
+int RequestResult(int reqId, int* result) {
+    if (reqId == 0 || !result) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    std::lock_guard lock(requestMutex);
+    const auto entry = requests.find(reqId);
+    if (entry == requests.end()) return SCE_NP_ERROR_REQUEST_NOT_FOUND;
+    if (!entry->second.async) return SCE_NP_ERROR_INVALID_ID;
+    if (entry->second.aborted) return SCE_NP_ERROR_ABORTED;
+    *result = SCE_NP_ERROR_SIGNED_OUT;
+    return NP_POLL_ASYNC_FINISHED;
 }
 
 using NpStateCallbackA = void (APS5_VABI *)(int userId, uint32_t state, void* userdata);
@@ -662,7 +686,11 @@ int APS5_VABI sceNpManagerIntLoginGetAccessToken(void) {
 }
 
 int APS5_VABI sceNpAbortRequest(int req_id) {
-    (void)req_id;
+    if (req_id == 0) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    std::lock_guard lock(requestMutex);
+    const auto entry = requests.find(req_id);
+    if (entry == requests.end()) return SCE_NP_ERROR_REQUEST_NOT_FOUND;
+    entry->second.aborted = true;
     return 0;
 }
 
@@ -703,18 +731,18 @@ int APS5_VABI sceNpCheckPremium(int req_id, const NpCheckPremiumParameter* param
 }
 
 int APS5_VABI sceNpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param) {
-    (void)param;
-    return AddRequest();
+    if (!param) return SCE_NP_ERROR_INVALID_ARGUMENT;
+    return AddRequest(true);
 }
 
 int APS5_VABI sceNpCreateRequest(void) {
-    return AddRequest();
+    return AddRequest(false);
 }
 
 int APS5_VABI sceNpDeleteRequest(int req_id) {
+    if (req_id == 0) return SCE_NP_ERROR_INVALID_ARGUMENT;
     std::lock_guard lock(requestMutex);
-    liveRequests.erase(req_id);
-    return 0;
+    return requests.erase(req_id) != 0 ? 0 : SCE_NP_ERROR_REQUEST_NOT_FOUND;
 }
 
 int APS5_VABI sceNpGetAccountAge(int req_id, int user_id, uint8_t* age) {
@@ -770,10 +798,7 @@ int APS5_VABI sceNpGetAccountId(const NpOnlineId* online_id, uint64_t* account_i
 int APS5_VABI sceNpSetGamePresenceOnline(int req_id, const NpOnlineId* online_id, uint32_t presence) {
     (void)presence;
     if (req_id == 0 || !online_id) return SCE_NP_ERROR_INVALID_ARGUMENT;
-    {
-        std::lock_guard lock(requestMutex);
-        if (!liveRequests.count(req_id)) return SCE_NP_ERROR_REQUEST_NOT_FOUND;
-    }
+    if (!RequestLive(req_id)) return SCE_NP_ERROR_REQUEST_NOT_FOUND;
     return SCE_NP_ERROR_SIGNED_OUT;
 }
 
@@ -823,9 +848,11 @@ int APS5_VABI sceNpHasSignedUp(int user_id, bool* has_signed_up) {
 }
 
 int APS5_VABI sceNpPollAsync(int req_id, int* result) {
-    (void)req_id;
-    if (result) *result = SCE_NP_ERROR_SIGNED_OUT;
-    return NP_POLL_ASYNC_FINISHED;
+    return RequestResult(req_id, result);
+}
+
+int APS5_VABI sceNpWaitAsync(int req_id, int* result) {
+    return RequestResult(req_id, result);
 }
 
 void APS5_VABI sceNpRegisterGamePresenceCallback(void* callback, void* userdata) {
@@ -895,8 +922,7 @@ int APS5_VABI sceNpSetTimeout(int reqId, int32_t resolveRetry, uint32_t resolveT
         belowMinimum(sendTimeout, minTransferTimeout) || belowMinimum(recvTimeout, minTransferTimeout)) {
         return SCE_NP_ERROR_INVALID_ARGUMENT;
     }
-    std::lock_guard lock(requestMutex);
-    return liveRequests.count(reqId) ? 0 : SCE_NP_ERROR_REQUEST_NOT_FOUND;
+    return RequestLive(reqId) ? 0 : SCE_NP_ERROR_REQUEST_NOT_FOUND;
 }
 
 int APS5_VABI sceNpUnregisterStateCallback(void) {

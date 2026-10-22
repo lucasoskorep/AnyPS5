@@ -30,7 +30,10 @@ int APS5_VABI sceNpUnregisterPlusEventCallback(void);
 extern "C" {
 int APS5_VABI sceNpCreateRequest(void);
 int APS5_VABI sceNpCreateAsyncRequest(const NpCreateAsyncRequestParameter* param);
+int APS5_VABI sceNpAbortRequest(int reqId);
 int APS5_VABI sceNpDeleteRequest(int reqId);
+int APS5_VABI sceNpPollAsync(int reqId, int* result);
+int APS5_VABI sceNpWaitAsync(int reqId, int* result);
 int APS5_VABI sceNpSetTimeout(int reqId, std::int32_t resolveRetry, std::uint32_t resolveTimeout,
     std::uint32_t connTimeout, std::uint32_t sendTimeout, std::uint32_t recvTimeout);
 }
@@ -53,7 +56,11 @@ constexpr int SignedOut = static_cast<int>(0x80550006u);
 constexpr int UserNotFound = static_cast<int>(0x80550007u);
 constexpr int AlreadyRegistered = static_cast<int>(0x80550008u);
 constexpr int NotRegistered = static_cast<int>(0x80550009u);
+constexpr int Aborted = static_cast<int>(0x80550012u);
 constexpr int RequestNotFound = static_cast<int>(0x80550014u);
+constexpr int InvalidId = static_cast<int>(0x80550015u);
+constexpr int AsyncFinished = 0;
+constexpr int UnsetResult = 0x5a5a5a5a;
 
 void Require(bool condition, const char* message) {
     if (!condition) {
@@ -221,6 +228,54 @@ void CheckRequestTimeouts() {
     Require(sceNpSetTimeout(asyncId, 2, 0, 0, 0, 0) == RequestNotFound, "deleted async request");
 }
 
+void CheckAsyncRequests() {
+    const int syncRequest = sceNpCreateRequest();
+    Require(syncRequest > 0, "sceNpCreateRequest must return a positive request id");
+    NpCreateAsyncRequestParameter param{};
+    const int asyncRequest = sceNpCreateAsyncRequest(&param);
+    Require(asyncRequest > 0, "sceNpCreateAsyncRequest must return a positive request id");
+    Require(sceNpCreateAsyncRequest(nullptr) == InvalidArgument, "sceNpCreateAsyncRequest must reject a null parameter");
+    int result = UnsetResult;
+    Require(sceNpPollAsync(asyncRequest, nullptr) == InvalidArgument, "sceNpPollAsync must reject a null result");
+    Require(sceNpWaitAsync(asyncRequest, nullptr) == InvalidArgument, "sceNpWaitAsync must reject a null result");
+    Require(sceNpPollAsync(0, &result) == InvalidArgument, "sceNpPollAsync must reject request id 0");
+    Require(sceNpWaitAsync(0, &result) == InvalidArgument, "sceNpWaitAsync must reject request id 0");
+    Require(sceNpPollAsync(0x7fffffff, &result) == RequestNotFound, "sceNpPollAsync must reject a request that was never created");
+    Require(sceNpWaitAsync(0x7fffffff, &result) == RequestNotFound, "sceNpWaitAsync must reject a request that was never created");
+    Require(sceNpPollAsync(syncRequest, &result) == InvalidId, "sceNpPollAsync must reject a synchronous request");
+    Require(sceNpWaitAsync(syncRequest, &result) == InvalidId, "sceNpWaitAsync must reject a synchronous request");
+    Require(result == UnsetResult, "a rejected request must leave the result untouched");
+    Require(sceNpPollAsync(asyncRequest, &result) == AsyncFinished, "sceNpPollAsync failed for a live async request");
+    Require(result == SignedOut, "sceNpPollAsync must publish the signed-out result");
+    result = UnsetResult;
+    Require(sceNpWaitAsync(asyncRequest, &result) == AsyncFinished, "sceNpWaitAsync failed for a live async request");
+    Require(result == SignedOut, "sceNpWaitAsync must publish the signed-out result");
+    Require(sceNpAbortRequest(asyncRequest) == 0, "sceNpAbortRequest failed for a live request");
+    Require(sceNpPollAsync(asyncRequest, &result) == Aborted, "sceNpPollAsync must report an aborted request");
+    Require(sceNpWaitAsync(asyncRequest, &result) == Aborted, "sceNpWaitAsync must report an aborted request");
+    Require(result == SignedOut, "an aborted request must leave the result untouched");
+    Require(sceNpDeleteRequest(asyncRequest) == 0, "sceNpDeleteRequest failed after an abort");
+    Require(sceNpDeleteRequest(asyncRequest) == RequestNotFound, "sceNpDeleteRequest must reject a deleted request");
+    Require(sceNpAbortRequest(asyncRequest) == RequestNotFound, "sceNpAbortRequest must reject a deleted request");
+    Require(sceNpPollAsync(asyncRequest, &result) == RequestNotFound, "sceNpPollAsync must reject a deleted request");
+    Require(sceNpWaitAsync(asyncRequest, &result) == RequestNotFound, "sceNpWaitAsync must reject a deleted request");
+    Require(sceNpAbortRequest(0) == InvalidArgument, "sceNpAbortRequest must reject request id 0");
+    Require(sceNpDeleteRequest(0) == InvalidArgument, "sceNpDeleteRequest must reject request id 0");
+    Require(sceNpAbortRequest(0x7fffffff) == RequestNotFound, "sceNpAbortRequest must reject a request that was never created");
+    Require(sceNpDeleteRequest(0x7fffffff) == RequestNotFound, "sceNpDeleteRequest must reject a request that was never created");
+    const int abortedSync = sceNpCreateRequest();
+    Require(abortedSync > 0, "sceNpCreateRequest must return a second positive request id");
+    Require(sceNpAbortRequest(abortedSync) == 0, "sceNpAbortRequest failed for a synchronous request");
+    Require(sceNpWaitAsync(abortedSync, &result) == InvalidId, "sceNpWaitAsync must reject an aborted synchronous request");
+    Require(sceNpDeleteRequest(abortedSync) == 0, "sceNpDeleteRequest must delete an aborted request");
+    Require(sceNpDeleteRequest(syncRequest) == 0, "sceNpDeleteRequest failed on the synchronous request");
+    const int reusedAsync = sceNpCreateAsyncRequest(&param);
+    Require(reusedAsync > asyncRequest, "sceNpCreateAsyncRequest must not reuse a deleted request id");
+    Require(sceNpPollAsync(reusedAsync, &result) == AsyncFinished, "sceNpPollAsync failed for a request created after a delete");
+    Require(result == SignedOut, "a new async request must publish the signed-out result");
+    Require(sceNpDeleteRequest(reusedAsync) == 0, "sceNpDeleteRequest failed on the new async request");
+}
+
 void CheckOnlineIdQueries() {
     NpOnlineId onlineId{};
     std::memcpy(onlineId.data, "player", 6);
@@ -280,6 +335,7 @@ int main() {
     CheckStateCallbacksA();
     CheckLegacyStateCallback();
     CheckRequestTimeouts();
+    CheckAsyncRequests();
     NpId npId{};
     std::memset(&npId, 0x5a, sizeof(npId));
     NpId untouched{};
